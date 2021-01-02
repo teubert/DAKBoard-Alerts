@@ -1,0 +1,258 @@
+<html>
+    <head>
+        <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+        <style>
+            #alert_table {
+                width: 100%;
+                color:darkred;
+                font-size: 18pt;
+                background:rgba(255, 255, 255, 0.7);
+            }
+        </style>
+        <script>
+            const LAT = 37.368832;
+            const LON = -122.03634;
+            const OHMHR_KEY = 'Qy8mlbzJ';
+            const INDOOR_PURPLE_AIR_KEY = 87769;
+            const OUTDOOR_PURPLE_AIR_KEY = 37003;
+
+            // Todo(CT): levels for alerts
+            class AlertGenerator {
+                alerts = new Array();
+
+                constructor() {
+                    var that = this
+                   	setTimeout(function() {
+                       that.update_loop()
+                       }, 500);
+                }
+
+                update_loop() {
+                    this.alerts = [];
+                    this.update()
+                    var that = this
+                   	setTimeout(function() {
+                       that.update_loop()
+                       }, this.update_freq);
+                }
+            }
+
+            class PurpleAirAlert extends AlertGenerator {
+                update_freq = 300000;
+
+                /** @type {Array<LevelAttribute>} sorted by threshold desc. */
+                static LEVEL_ATTRIBUTES = [
+                    {'thresh': 300, 'label': "Hazardous"}, 
+                    {'thresh': 200, 'label': "Very Unhealthy"},
+                    {'thresh': 150, 'label': "Unhealthy"},
+                    {'thresh': 100, 'label': "Unhealthy for Sensitive Groups"},
+                    {'thresh': 50, 'label': "Moderate"}, 
+                    {'thresh': 0, 'label': "Good"}
+                ]
+                id;
+                label;
+                limit;
+                value;
+
+                constructor(id, label, limit) {
+                    super();
+                    this.id = id;
+                    this.label = label;
+                    this.limit = limit;
+                }
+
+                static calculateAQI(Cp, Ih, Il, BPh, BPl) {
+                    const a = Ih - Il;
+                    const b = BPh - BPl;
+                    const c = Cp - BPl;
+                    return Math.round((a / b) * c + Il);
+                }
+
+                /**
+                 * Get AQI number from PPM reading
+                 *
+                 * @param {number} pm
+                 * @returns {number|'-'}
+                 */
+                static aqiFromPM(pm) {
+                    if (pm > 350.5) return PurpleAirAlert.calculateAQI(pm, 500.0, 401.0, 500.0, 350.5);
+                    if (pm > 250.5) return PurpleAirAlert.calculateAQI(pm, 400.0, 301.0, 350.4, 250.5);
+                    if (pm > 150.5) return PurpleAirAlert.calculateAQI(pm, 300.0, 201.0, 250.4, 150.5);
+                    if (pm > 55.5) return PurpleAirAlert.calculateAQI(pm, 200.0, 151.0, 150.4, 55.5);
+                    if (pm > 35.5) return PurpleAirAlert.calculateAQI(pm, 150.0, 101.0, 55.4, 35.5);
+                    if (pm > 12.1) return PurpleAirAlert.calculateAQI(pm, 100.0, 51.0, 35.4, 12.1);
+                    if (pm >= 0.0) return PurpleAirAlert.calculateAQI(pm, 50.0, 0.0, 12.0, 0.0);
+                    return "-";
+                }
+
+                /**
+                 * Calculates the AQI level
+                 * based on https://cfpub.epa.gov/airnow/index.cfm?action=aqibasics.aqi#unh
+                 *
+                 * @param {number|'-'} aqi
+                 * @returns {LevelAttribute & { level: number }}
+                 */
+                static calculateLevel(aqi) {
+                    let level = Number(aqi) || 0;
+                    let val = PurpleAirAlert.LEVEL_ATTRIBUTES.find(val => level > val.thresh);
+                    return val.label;
+                }
+
+                async update() {
+                    let url = 'https://www.purpleair.com/json?show=' + this.id;    
+                    let response = await fetch(url);
+                    let json = await response.json();
+                    let stats = JSON.parse(json['results']['0']['Stats']);
+                    let aqi = PurpleAirAlert.aqiFromPM(stats['v1']);
+                    self.value = aqi;
+                    if (aqi >= this.limit) { // >
+                        let label = PurpleAirAlert.calculateLevel(aqi);
+                        this.alerts = [this.label + " AQI " + label + " (" + aqi + ")"];
+                        return;
+                    }
+
+                    this.alerts = Array();
+                }
+
+            }
+
+            class EarthquakeAlert extends AlertGenerator {
+                update_freq = 300000;
+                mag
+                dist
+
+                constructor(mag, dist) {
+                    super();
+                    this.mag = mag;
+                    this.dist = dist;
+                }
+
+                get_yesterday_datestr() {
+                    var d = new Date();
+                    d.setDate(d.getDate()-1);
+                    return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate() +'T' + d.getHours() + ':' + d.getMinutes() + ':' + d.getSeconds();
+                }
+
+                get_earthquake_url(mag, radius) {
+                    var time = this.get_yesterday_datestr();
+                    return 'https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&latitude=' + LAT + '&longitude=' + LON + '&maxradiuskm='+radius+'&minmagnitude='+mag+'&starttime='+time;
+                }
+                
+                async update() {
+                    var url = this.get_earthquake_url(this.mag, this.dist);
+                    try {
+                        var response = await fetch(url);
+                    } catch (reason) {
+                        return "Warning: Couldn't get earthquake alerts"
+                    }
+                    var json_text = await response.json();
+
+                    for(var i = 0; i < json_text["features"].length; i++) {
+                        var feature = json_text["features"][i]
+                        var feature_str = "Mag " + feature['properties']['mag'] + " Earthquake " + feature['properties']['place']
+                        this.alerts.push(feature_str + "\n")
+                    }
+                }
+            }
+
+            class WeatherAlert extends AlertGenerator {
+                update_freq = 300000;
+                url = 'https://api.weather.gov/alerts/active?point='+ LAT + ',' + LON;
+                async update() {
+                    try {
+                        var response = await fetch(this.url);
+                    } catch (reason) {
+                        this.alerts = ["Warning: Couldn't get weather alerts"]
+                    }
+                    var json_text = await response.json();
+                    this.alerts = json_text['features'];
+                }
+            }
+
+            class OhmConnectAlert extends AlertGenerator {
+                update_freq = 300000;
+                url = 'https://api.allorigins.win/get?url=https://login.ohmconnect.com/verify-ohm-hour/' + OHMHR_KEY;
+
+                async update() {
+                    try {
+                        var response = await fetch(this.url);
+                    } catch (reason) {
+                        this.alerts = ["Couldn't get OhmHour Status"]
+                    }
+                    var json_text = await response.json();
+                    var test = (new DOMParser()).parseFromString(json_text['contents'], "text/xml");
+                    if (test.documentElement.childNodes[3].innerHTML != "None") {
+                        this.alerts = ["OhmHour Active"]
+                    }
+                }
+            }
+            
+            class CompositeAlert {
+                alertGenerators = [];
+                alert_list = [];
+
+                push(gen) {
+                    alertGenerators.push(gen);
+                }
+
+                get alerts() {
+                    this.alert_list = []
+                    for (var i = 0; i < this.alertGenerators.length; i++) {
+                        this.alert_list.concat(this.alertGenerators[i].alerts);
+                    }
+                    return this.alert_list;
+                }
+            }
+
+            class Dashboard {
+                update_freq = 300000;
+                alertGenerators = new Array();
+                constructor() {
+                    this.alertGenerators.push(new EarthquakeAlert(4.5, 600));
+                    this.alertGenerators.push(new EarthquakeAlert(3.5, 200)); // 3.5
+                    this.alertGenerators.push(new PurpleAirAlert(INDOOR_PURPLE_AIR_KEY, 'Indoor', 100));
+                    this.alertGenerators.push(new PurpleAirAlert(OUTDOOR_PURPLE_AIR_KEY, 'Outdoor', 150));
+                    this.alertGenerators.push(new WeatherAlert());
+                    this.alertGenerators.push(new OhmConnectAlert());
+
+                    var that = this;
+                   	setTimeout(function() {
+                       that.update_loop();
+                       }, 5000);
+                }
+                
+                update_loop() {
+                    this.update();
+                    var that = this;
+                   	setTimeout(function() {
+                       that.update_loop();
+                       }, 5000);
+                }
+
+                update() {
+                	document.getElementById("alert_table").innerHTML = ""
+                    for (var i = 0; i < this.alertGenerators.length; i++) {
+                        try {
+                            var alerts = this.alertGenerators[i].alerts;
+
+                            for (var j = 0; j < alerts.length; j++) {
+                                document.getElementById("alert_table").innerHTML += '<tr><td><i class="material-icons" style="font-size:32px;color:red">warning</i></td><td> ' + alerts[j] + "</td></tr>";
+                            }
+                        } catch (ex) {
+                            document.getElementById("alert_table").innerHTML += '<tr><td><i class="material-icons" style="font-size:32px;color:red">error</i></td><td>error in processing alert: ' + ex +'</td></tr>';
+                        }
+                    }
+                }
+            }
+            d = new Dashboard()
+
+        </script>
+    </head>
+    <body>
+        <table id="alert_table">
+        </table>
+        <p id="debug"></p>
+        <script>
+        </script>
+    </body>
+</html>
